@@ -1,0 +1,166 @@
+import { Stack, StackProps, RemovalPolicy, Duration } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import {
+  Bucket,
+  BlockPublicAccess,
+  BucketEncryption,
+} from 'aws-cdk-lib/aws-s3';
+import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
+import { PythonFunction } from '@aws-cdk/aws-lambda-python-alpha';
+import { RestApi, LambdaIntegration } from 'aws-cdk-lib/aws-apigateway';
+import {
+  AmazonLinuxGeneration,
+  AmazonLinuxImage,
+  Instance,
+  InstanceClass,
+  InstanceSize,
+  InstanceType,
+  IpAddresses,
+  Peer,
+  Port,
+  SecurityGroup,
+  SubnetType,
+  Vpc,
+} from 'aws-cdk-lib/aws-ec2';
+import { Code, LayerVersion, Runtime } from 'aws-cdk-lib/aws-lambda';
+import { ManagedPolicy } from 'aws-cdk-lib/aws-iam';
+import { readFileSync } from 'fs';
+import { ApplicationLoadBalancedFargateService } from 'aws-cdk-lib/aws-ecs-patterns';
+import {
+  Cluster,
+  ContainerImage,
+  FargateTaskDefinition,
+} from 'aws-cdk-lib/aws-ecs';
+import { FargateCluster } from 'aws-cdk-lib/aws-eks';
+import {
+  ParameterTier,
+  ParameterType,
+  StringParameter,
+} from 'aws-cdk-lib/aws-ssm';
+
+export class RagbotStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    // Networking
+
+    const vpc = new Vpc(this, 'VpcLambda', {
+      ipAddresses: IpAddresses.cidr('10.0.0.0/16'),
+      maxAzs: 2,
+      natGateways: 0,
+      subnetConfiguration: [
+        {
+          cidrMask: 24,
+          name: 'private',
+          subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+        },
+        {
+          cidrMask: 24,
+          name: 'public',
+          subnetType: SubnetType.PUBLIC,
+        },
+      ],
+    });
+
+    const databaseSecurityGroup = new SecurityGroup(this, 'DbSecurityGroup', {
+      vpc,
+    });
+
+    const lambdaSecurityGroup = new SecurityGroup(this, 'LambdaSecurityGroup', {
+      vpc,
+      allowAllOutbound: true,
+    });
+
+    const chromaSecurityGroup = new SecurityGroup(this, 'ChromaSecurityGroup', {
+      vpc,
+    });
+    chromaSecurityGroup.addIngressRule(
+      Peer.anyIpv4(),
+      Port.tcp(22),
+      'Chroma Instance Security Group SSH'
+    );
+    chromaSecurityGroup.addIngressRule(
+      Peer.anyIpv4(),
+      Port.tcp(8000),
+      'Chroma Instance Security Group Docker'
+    );
+
+    // Database - ChromaDB
+    /*
+    const ec2Instance = new Instance(this, 'ChromaInstance', {
+      vpc,
+      vpcSubnets: vpc.selectSubnets({
+        subnetType: SubnetType.PUBLIC,
+      }),
+      instanceType: InstanceType.of(InstanceClass.T3, InstanceSize.SMALL),
+      machineImage: new AmazonLinuxImage({
+        generation: AmazonLinuxGeneration.AMAZON_LINUX_2,
+      }),
+      securityGroup: chromaSecurityGroup,
+    });
+    // 👇 load user data script
+    const userDataScript = readFileSync('./lib/user-data.sh', 'utf8');
+    // 👇 add user data to the EC2 instance
+    ec2Instance.addUserData(userDataScript);
+    */
+
+    // S3 Bucket
+
+    const bucket = new Bucket(this, 'PdfBucket', {
+      bucketName: 'ragbot-pdfbucket',
+      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
+      encryption: BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      autoDeleteObjects: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    new BucketDeployment(this, 'DeployFiles', {
+      sources: [Source.asset('./data')],
+      destinationBucket: bucket,
+    });
+
+    // Lambda Functions
+
+    const vectorizer = new PythonFunction(this, 'Vectorizer', {
+      entry: 'src/vectorizer',
+      runtime: Runtime.PYTHON_3_10,
+      memorySize: 5120,
+      timeout: Duration.minutes(3),
+      environment: {
+        REGION_NAME: this.region,
+        S3_BUCKET_NAME: bucket.bucketName,
+      },
+      retryAttempts: 0,
+    });
+    vectorizer.role?.addManagedPolicy(
+      ManagedPolicy.fromAwsManagedPolicyName(
+        'service-role/AWSLambdaVPCAccessExecutionRole'
+      )
+    );
+    vectorizer.role?.addManagedPolicy({
+      managedPolicyArn: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess',
+    });
+
+    bucket.grantRead(vectorizer);
+    //cluster.secret?.grantRead(vectorizer);
+    databaseSecurityGroup.addIngressRule(
+      lambdaSecurityGroup,
+      Port.tcp(5432),
+      'Lambda to Postgres database'
+    );
+
+    // REST API
+
+    const api = new RestApi(this, 'ragbot-api', {
+      restApiName: 'Ragbot',
+      description: 'This API is for Ragbot',
+    });
+
+    const lambdaIntegration = new LambdaIntegration(vectorizer, {
+      requestTemplates: { 'application/json': '{ "statusCode": "200" }' },
+    });
+
+    api.root.addMethod('POST', lambdaIntegration);
+  }
+}

@@ -1,0 +1,192 @@
+import { Stack, StackProps, RemovalPolicy, Duration } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { Bucket, BlockPublicAccess, BucketEncryption } from 'aws-cdk-lib/aws-s3';
+import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
+import { PythonFunction } from '@aws-cdk/aws-lambda-python-alpha';
+import { RestApi, LambdaIntegration } from 'aws-cdk-lib/aws-apigateway';
+import {
+  GatewayVpcEndpoint,
+  GatewayVpcEndpointAwsService,
+  InterfaceVpcEndpoint,
+  InterfaceVpcEndpointService,
+  IpAddresses,
+  Port,
+  SecurityGroup,
+  SubnetType,
+  Vpc,
+} from 'aws-cdk-lib/aws-ec2';
+import {
+  AuroraCapacityUnit,
+  AuroraPostgresEngineVersion,
+  Credentials,
+  DatabaseClusterEngine,
+  ParameterGroup,
+  ServerlessCluster,
+  TimeoutAction,
+} from 'aws-cdk-lib/aws-rds';
+import { Runtime } from 'aws-cdk-lib/aws-lambda';
+import { AnyPrincipal, ManagedPolicy, PolicyStatement } from 'aws-cdk-lib/aws-iam';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
+
+export class RagbotStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    // Networking
+
+    const vpc = new Vpc(this, 'VpcLambda', {
+      ipAddresses: IpAddresses.cidr('10.0.0.0/16'),
+      maxAzs: 2,
+      natGateways: 0,
+      subnetConfiguration: [
+        {
+          cidrMask: 24,
+          name: 'private',
+          subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+        },
+        {
+          cidrMask: 24,
+          name: 'public',
+          subnetType: SubnetType.PUBLIC,
+        },
+      ],
+    });
+
+    const databaseSecurityGroup = new SecurityGroup(this, 'DbSecurityGroup', {
+      vpc,
+    });
+
+    const lambdaSecurityGroup = new SecurityGroup(this, 'LambdaSecurityGroup', {
+      vpc,
+      allowAllOutbound: true,
+    });
+
+    // Database
+    // https://www.freecodecamp.org/news/aws-lambda-rds/
+
+    const secret = new Secret(this, 'DBCredentialsSecret', {
+      secretName: `aurora-serverless-credentials`,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({
+          username: 'clusteradmin',
+        }),
+        excludePunctuation: true,
+        includeSpace: false,
+        generateStringKey: 'password',
+      },
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    // Create a new VPC endpoint for Secrets Manager
+    new InterfaceVpcEndpoint(this, 'SecretsManagerEndpoint', {
+      vpc,
+      service: new InterfaceVpcEndpointService('com.amazonaws.us-east-1.secretsmanager'),
+      privateDnsEnabled: true,
+      securityGroups: [lambdaSecurityGroup],
+      subnets: {
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+      },
+    });
+
+    const cluster = new ServerlessCluster(this, 'AuroraCluster', {
+      engine: DatabaseClusterEngine.auroraPostgres({
+        version: AuroraPostgresEngineVersion.VER_13_12,
+      }),
+      parameterGroup: ParameterGroup.fromParameterGroupName(this, 'ParameterGroup', 'default.aurora-postgresql13'),
+      vpc,
+      securityGroups: [databaseSecurityGroup],
+      credentials: Credentials.fromSecret(secret),
+      clusterIdentifier: 'ragbot-db',
+      defaultDatabaseName: 'ragbot',
+      scaling: {
+        autoPause: Duration.minutes(5),
+        minCapacity: AuroraCapacityUnit.ACU_2,
+        maxCapacity: AuroraCapacityUnit.ACU_8,
+        timeout: Duration.seconds(60),
+        timeoutAction: TimeoutAction.ROLLBACK_CAPACITY_CHANGE,
+      },
+    });
+
+    // S3 Bucket
+
+    const s3Endpoint = new GatewayVpcEndpoint(this, 'S3Vpce', {
+      service: GatewayVpcEndpointAwsService.S3,
+      vpc,
+    });
+    s3Endpoint.addToPolicy(
+      new PolicyStatement({
+        principals: [new AnyPrincipal()],
+        actions: ['s3:GetObject'],
+        resources: ['*'],
+      })
+    );
+
+    const bucket = new Bucket(this, 'PdfBucket', {
+      bucketName: 'ragbot-pdfbucket',
+      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
+      encryption: BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      autoDeleteObjects: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    // const denyAccessToNotVpce = new PolicyStatement({
+    //   actions: ['s3:*'],
+    //   effect: Effect.DENY,
+    //   principals: [new AnyPrincipal()],
+    //   resources: [`arn:aws:s3:::${bucket.bucketName}/*`],
+    //   conditions: {
+    //     StringNotEquals: {
+    //       'aws:sourceVpce': `${s3Endpoint.vpcEndpointId}`,
+    //     },
+    //   },
+    // });
+    // bucket.addToResourcePolicy(denyAccessToNotVpce);
+
+    new BucketDeployment(this, 'DeployFiles', {
+      sources: [Source.asset('./data')],
+      destinationBucket: bucket,
+    });
+
+    // Lambda Functions
+
+    const vectorizer = new PythonFunction(this, 'Vectorizer', {
+      entry: 'src/vectorizer',
+      runtime: Runtime.PYTHON_3_10,
+      memorySize: 5120,
+      timeout: Duration.minutes(3),
+      environment: {
+        SECRET_NAME: secret.secretName,
+        REGION_NAME: this.region,
+        S3_ENDPOINT: s3Endpoint.vpcEndpointId,
+        S3_BUCKET_NAME: bucket.bucketName,
+      },
+      vpc,
+      vpcSubnets: vpc.selectSubnets({
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+      }),
+      securityGroups: [lambdaSecurityGroup],
+      retryAttempts: 0,
+    });
+    vectorizer.role?.addManagedPolicy(ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole'));
+    vectorizer.role?.addManagedPolicy({
+      managedPolicyArn: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess',
+    });
+
+    bucket.grantRead(vectorizer);
+    cluster.secret?.grantRead(vectorizer);
+    databaseSecurityGroup.addIngressRule(lambdaSecurityGroup, Port.tcp(5432), 'Lambda to Postgres database');
+
+    // REST API
+
+    const api = new RestApi(this, 'ragbot-api', {
+      restApiName: 'Ragbot',
+      description: 'This API is for Ragbot',
+    });
+
+    const lambdaIntegration = new LambdaIntegration(vectorizer, {
+      requestTemplates: { 'application/json': '{ "statusCode": "200" }' },
+    });
+
+    api.root.addMethod('POST', lambdaIntegration);
+  }
+}

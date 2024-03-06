@@ -1,0 +1,152 @@
+import { Stack, StackProps, RemovalPolicy, Duration } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { Bucket, BlockPublicAccess, BucketEncryption } from 'aws-cdk-lib/aws-s3';
+import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
+import { PythonFunction } from '@aws-cdk/aws-lambda-python-alpha';
+import { RestApi, LambdaIntegration } from 'aws-cdk-lib/aws-apigateway';
+import { Runtime } from 'aws-cdk-lib/aws-lambda';
+import { CfnCollection, CfnSecurityPolicy, CfnAccessPolicy } from 'aws-cdk-lib/aws-opensearchserverless';
+import { ManagedPolicy, Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
+
+export class RagbotStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
+    super(scope, id, props);
+
+    // OpenSearch Serverless collection
+    // https://github.com/cloudswb/aws-genai-bedrock-builder
+
+    // Bedrock Knowledge Base IAM role
+    const kbRoleArn = new Role(this, `CollBedrockKnowledgeBaseRole`, {
+      roleName: `AmazonBedrockExecutionRoleForKnowledgeBase`,
+      assumedBy: new ServicePrincipal('bedrock.amazonaws.com'),
+      managedPolicies: [ManagedPolicy.fromAwsManagedPolicyName('AdministratorAccess')],
+    }).roleArn;
+
+    // Lambda IAM role
+    const customResourceRole = new Role(this, `CollCustomResourceRole`, {
+      assumedBy: new ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
+    });
+
+    const collection = new CfnCollection(this, 'MyCfnCollection', {
+      name: 'vector',
+      description: 'vector db',
+      type: 'VECTORSEARCH',
+    });
+
+    const encryptionPolicy = {
+      Rules: [{ ResourceType: 'collection', Resource: [`collection/${collection.name}`] }],
+      AWSOwnedKey: true,
+    };
+    const encryptionPolicyCfn = new CfnSecurityPolicy(this, 'OpensearchEncryptionPolicy', {
+      name: 'encryption-policy',
+      type: 'encryption',
+      policy: JSON.stringify(encryptionPolicy),
+    });
+
+    const networkPolicy = [
+      {
+        Rules: [
+          { ResourceType: 'collection', Resource: [`collection/${collection.name}`] },
+          { ResourceType: 'dashboard', Resource: [`collection/${collection.name}`] },
+        ],
+        AllowFromPublic: true,
+      },
+    ];
+    const networkPolicyCfn = new CfnSecurityPolicy(this, 'OpensearchNetworkPolicy', {
+      name: 'network-policy',
+      type: 'network',
+      policy: JSON.stringify(networkPolicy),
+    });
+
+    const accessPolicy = [
+      {
+        Description: 'Access',
+        Rules: [
+          {
+            ResourceType: 'index',
+            Resource: [`index/${collection.name}/*`],
+            Permission: [
+              'aoss:ReadDocument',
+              'aoss:WriteDocument',
+              'aoss:CreateIndex',
+              'aoss:DeleteIndex',
+              'aoss:UpdateIndex',
+              'aoss:DescribeIndex',
+            ],
+          },
+          {
+            ResourceType: 'collection',
+            Resource: [`collection/${collection.name}`],
+            Permission: [
+              'aoss:CreateCollectionItems',
+              'aoss:DeleteCollectionItems',
+              'aoss:UpdateCollectionItems',
+              'aoss:DescribeCollectionItems',
+            ],
+          },
+        ],
+        Principal: [customResourceRole.roleArn, kbRoleArn],
+      },
+    ];
+    const dataAccessPolicyCfn = new CfnAccessPolicy(this, 'OpensearchDataAccessPolicy', {
+      name: 'access-policy',
+      type: 'data',
+      policy: JSON.stringify(accessPolicy),
+    });
+
+    collection.addDependency(encryptionPolicyCfn);
+    collection.addDependency(networkPolicyCfn);
+    collection.addDependency(dataAccessPolicyCfn);
+
+    // S3 Bucket
+
+    const bucket = new Bucket(this, 'PdfBucket', {
+      bucketName: 'ragbot-pdfbucket',
+      blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
+      encryption: BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      autoDeleteObjects: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    new BucketDeployment(this, 'DeployFiles', {
+      sources: [Source.asset('./data')],
+      destinationBucket: bucket,
+    });
+
+    // Lambda Functions
+
+    const vectorizer = new PythonFunction(this, 'Vectorizer', {
+      entry: 'src/vectorizer',
+      runtime: Runtime.PYTHON_3_10,
+      memorySize: 5120,
+      timeout: Duration.minutes(3),
+      environment: {
+        REGION_NAME: this.region,
+        S3_BUCKET_NAME: bucket.bucketName,
+      },
+      retryAttempts: 0,
+    });
+    vectorizer.role?.addManagedPolicy(ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole'));
+    vectorizer.role?.addManagedPolicy({
+      managedPolicyArn: 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess',
+    });
+
+    bucket.grantRead(vectorizer);
+
+    // REST API
+
+    const api = new RestApi(this, 'ragbot-api', {
+      restApiName: 'Ragbot',
+      description: 'This API is for Ragbot',
+    });
+
+    const lambdaIntegration = new LambdaIntegration(vectorizer, {
+      requestTemplates: { 'application/json': '{ "statusCode": "200" }' },
+    });
+
+    api.root.addMethod('POST', lambdaIntegration);
+  }
+}

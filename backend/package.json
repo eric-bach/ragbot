@@ -1,0 +1,31 @@
+{
+  "name": "ragbot",
+  "version": "0.1.0",
+  "bin": {
+    "ragbot": "bin/ragbot-chat.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "deploy": "npm run build --prefix ../frontend && npx cdk deploy -c appName=ragbot -c envName=dev --require-approval never --profile bach-dev",
+    "deploy-prod": "npm run build-prod --prefix ../frontend && npx cdk deploy -c appName=ragbot -c envName=prod --require-approval never --profile bach-prod",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.11",
+    "@types/node": "20.10.4",
+    "aws-cdk": "2.118.0",
+    "dotenv": "^16.4.1",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.3.3"
+  },
+  "dependencies": {
+    "@aws-cdk/aws-apigatewayv2-integrations": "^1.204.0",
+    "@aws-cdk/aws-lambda-python-alpha": "^2.118.0-alpha.0",
+    "aws-cdk-lib": "2.118.0",
+    "cdk-aws-lambda-powertools-layer": "^3.7.0",
+    "constructs": "^10.0.0",
+    "source-map-support": "^0.5.21"
+  }
+}
