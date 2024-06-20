@@ -27,11 +27,11 @@ const Chat: React.FC = () => {
     const client = new WebSocket(`${import.meta.env.VITE_API_WEBSOCKET_ENDPOINT}?idToken=${idToken}`);
 
     client.onopen = (e) => {
-      console.log('WebSocket connection established.');
+      console.log('WebSocket connection established');
     };
 
     client.onerror = (e: any) => {
-      console.error(e);
+      console.error('WebSocket error', e);
 
       setTimeout(async () => {
         await initializeClient();
@@ -44,13 +44,13 @@ const Chat: React.FC = () => {
           await initializeClient();
         });
       } else {
-        console.log('WebSocket connection closed.');
+        console.log('WebSocket connection closed');
       }
     };
 
     client.onmessage = async (message: any) => {
       const event = JSON.parse(message.data);
-      console.log(`Received message for ${event.conversationId}`, event);
+      //console.log(`Received message for ${event.conversationId}`, event);
 
       setPrompt('');
       fetchData(event.conversationId); //conversation?.conversationId
@@ -63,9 +63,7 @@ const Chat: React.FC = () => {
   const fetchData = async (conversationid = params.conversationid) => {
     setLoadingChat(true);
 
-    console.log('Fetching data', conversationid);
     const conversation = await API.get('ragbot-api', `/doc/${params.documentid}/${conversationid}`, {});
-    console.log('Received data', conversation);
     setConversation(conversation);
 
     setLoadingChat(false);
@@ -116,7 +114,7 @@ const Chat: React.FC = () => {
   const submitMessage = async (event: any) => {
     setLoadingMessage(true);
 
-    console.log('Submitting ', conversation?.conversationId);
+    //console.log('Submitting ', conversation?.conversationId);
 
     const user = await Auth.currentAuthenticatedUser();
 
