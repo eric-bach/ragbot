@@ -1,6 +1,0 @@
-boto3
-langchain
-#chromadb
-#chromadb-client
-#pypdf
-#psycopg2-binary

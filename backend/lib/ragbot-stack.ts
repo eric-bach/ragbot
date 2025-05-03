@@ -423,7 +423,7 @@ export class RagbotStack extends Stack {
     table.grantReadWriteData(disconnectWebsocket);
 
     const authWebsocket = new NodejsFunction(this, 'AuthWebsocket', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_22_X,
       entry: 'src/auth_websocket/index.ts',
       environment: {
         USER_POOL_ID: userPool.userPoolId,
